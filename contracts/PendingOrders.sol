@@ -11,73 +11,83 @@ import "./ISecondaryPool.sol";
 contract PendingOrders is DSMath, Ownable {
 
 	using SafeMath for uint256;
-	
+
 	struct Order {
 		address orderer;
 		uint amount;
 		bool isWhite;
 		uint eventId;
-		bool isPending; // True when placed, False when canceled or executed.
-		bool isExecuted; // False when placed, True when executed.
-		uint placingPrice; // Price when placing order
-		uint executingPrice; // Price when executing order
+		bool isPending;
 	}
 
-	/* events will be declared and defined as front end requires
-	event orderCreated(uint ordersId);
-	event orderCanceled(uint orderId);
-	*/
+	uint public ordersCount;
 
-	// "ordersCount" indicates how many orders have been placed so far.
-	// Array Orders stores all orders placed by users.
-	uint ordersCount;
-	Order[] public Orders;
-
-	// Max and min prices are defined manually as following since it's meaningless in this contract.
-	uint public _maxPrice = 100 * WAD;
-	uint public _minPrice = 0 * WAD;
-
-	// Withdraw fee of collateral tokens are initiated as 0.01%, but can be still changed.
+	uint constant _maxPrice = 100 * WAD;
+	uint constant _minPrice = 0;
 	uint public _FEE = 1e14;
-
-	// Fee collected so far is kept in _collectedFee
-	uint public _collectedFee;
+	uint _collectedFee;
 
 	IERC20 public _collateralToken;
 	ISecondaryPool public _secondaryPool;
 
 	address public _feeWithdrawAddress;
 	address public _eventContractAddress;
+	address public _secondaryPoolAddress;
+
+	mapping(uint => Order) Orders;
+	mapping(address => uint[]) ordersOfUser;
+	
+	struct detail {
+	    uint whiteAmount;
+	    uint blackAmount;
+	    uint whitePriceBefore;
+	    uint blackPriceBefore;
+	    uint whitePriceAfter;
+	    uint blackPriceAfter;
+	    bool isExecuted;
+	}
+	
+	mapping(uint => detail) detailForEvent;
+
+	event orderCreated(uint);
+	event orderCanceled(uint);
+	event collateralWithdrew(uint);
+	event contractOwnerChanged(address);
+	event secondaryPoolAddressChanged(address);
+	event eventContractAddressChanged(address);
+	event feeWithdrawAddressChanged(address);
+	event feeWithdrew(uint);
+	event feeChanged(uint);
 
 	constructor (
 		address secondaryPoolAddress,
 		address collateralTokenAddress,
 		address feeWithdrawAddress,
-        address eventContractAddress
+		address eventContractAddress
 	) {
 		require(
 			secondaryPoolAddress != address(0),
-			"Secondary Pool address should not be null"
+			"SECONDARY POOL ADDRESS SHOULD NOT BE NULL"
 		);
 		require(
 			collateralTokenAddress != address(0),
-			"Collateral token address should not be null"
+			"COLLATERAL TOKEN ADDRESS SHOULD NOT BE NULL"
 		);
 		require(
 			feeWithdrawAddress != address(0),
-			"Fee withdraw address should not be null"
+			"FEE WITHDRAW ADDRESS SHOULD NOT BE NULL"
 		);
 		require(
 			eventContractAddress != address(0),
-			"Event address should not be null"
+			"EVENT ADDRESS SHOULD NOT BE NULL"
 		);
-		_secondaryPool = ISecondaryPool(secondaryPoolAddress);
+		_secondaryPoolAddress = secondaryPoolAddress;
+		_secondaryPool = ISecondaryPool(_secondaryPoolAddress);
 		_collateralToken = IERC20(collateralTokenAddress);
 		_feeWithdrawAddress = feeWithdrawAddress;
 		_eventContractAddress = eventContractAddress;
 	}
 
-	// Modifier to ensure call has been made by event contract
 	modifier onlyEventContract {
         require(
             msg.sender == _eventContractAddress,
@@ -86,148 +96,155 @@ contract PendingOrders is DSMath, Ownable {
         _;
     }
 
-	function createOrder(uint _amount, bool _isWhite, uint _eventId) external {
-		require(
+    function createOrder(uint _amount, bool _isWhite, uint _eventId) external returns(uint) {
+    	require(
 			_collateralToken.balanceOf(msg.sender) >= _amount,
-			"Not enough collaeral in user's account"
-		);
-		Order storage _newOrder = Order(
+			"NOT ENOUGH COLLATERAL IN USER'S ACCOUNT"
+		);		
+		ordersCount++;
+		Orders[ordersCount] = Order(
 			msg.sender,
 			_amount,
 			_isWhite,
 			_eventId,
-			true,
-			false,
-			_isWhite? _secondaryPool._whitePrice: _secondaryPool._blackPrice
+			true
 		);
-		Orders.push(_newOrder);
+		_isWhite
+			? detailForEvent[_eventId].whiteAmount = detailForEvent[_eventId].whiteAmount.add(_amount)
+			: detailForEvent[_eventId].blackAmount = detailForEvent[_eventId].blackAmount.add(_amount);
+			
+		ordersOfUser[msg.sender].push(ordersCount);
 
-		// Gather collateral from the orderer.
 		_collateralToken.transferFrom(msg.sender, address(this), _amount);
+		emit orderCreated(ordersCount);
+		return ordersCount;
+    }
 
-		ordersCount++;
-		// emit orderCreated(ordersCount);
-	}
-
-	function cancelOrder(uint _orderId) external {
+    function cancelOrder(uint _orderId) external {
+        Order memory _Order = Orders[_orderId];
+    	require(
+    		_Order.isPending,
+			"ORDER HAS ALREADY BEEN CANCELED"
+		);
 		require(
-			Orders[_orderId].isPending,
-			"Selected order is not available at the moment"
+			msg.sender == _Order.orderer,
+			"NOT ALLOWED TO CANCEL THE ORDER"
 		);
-		Order storage _orderToCancel = Orders[_orderId];
-		require(msg.sender == _orderToCancel.orderer, "Only orderer can cancel the order");
-
-		// Return collateral token to the user
-		_collateralToken.transferFrom(
-			address(this),
-			_orderToCancel.orderer,
-			_orderToCancel.amount
+		_collateralToken.transfer(
+			_Order.orderer,
+			_Order.amount
 		);
+		_Order.isWhite
+			? detailForEvent[_Order.eventId].whiteAmount = detailForEvent[_Order.eventId].whiteAmount.sub(_Order.amount)
+			: detailForEvent[_Order.eventId].blackAmount = detailForEvent[_Order.eventId].blackAmount.sub(_Order.amount);
+		_Order.isPending = false;
+		emit orderCanceled(_orderId);
+    }
 
-		_orderToCancel.isPending = false;
-		// emit orderCanceled(_orderId);
-	}
+    function eventStart(uint _eventId) external onlyEventContract {
+    	_secondaryPool.buyWhite(_maxPrice, detailForEvent[_eventId].whiteAmount);
+    	_secondaryPool.buyBlack(_maxPrice, detailForEvent[_eventId].blackAmount);
+    	detailForEvent[_eventId].whitePriceBefore = _secondaryPool._whitePrice();
+    	detailForEvent[_eventId].blackPriceBefore = _secondaryPool._blackPrice();
+    }
 
-	// Total W/B token amounts for current event.
-	uint whiteTokenAmount;
-	uint blackTokenAmount;
+    function eventEnd(uint _eventId) external onlyEventContract {
+    	_secondaryPool.sellWhite(_minPrice, detailForEvent[_eventId].whiteAmount);
+    	_secondaryPool.sellBlack(_minPrice, detailForEvent[_eventId].blackAmount);
+    	detailForEvent[_eventId].whitePriceAfter = _secondaryPool._whitePrice();
+    	detailForEvent[_eventId].blackPriceAfter = _secondaryPool._blackPrice();
+    	detailForEvent[_eventId].isExecuted = true;
+    }
 
-	function eventStart(uint _eventId) external onlyEventContract {
+    function withdrawCollateral() external returns(uint) {
+        uint totalWithdrawAmount;
+        for (uint i = 0; i < ordersOfUser[msg.sender].length; i++) {
+            uint _oId = ordersOfUser[msg.sender][i];
+            uint _eId = Orders[_oId].eventId;
+            if (Orders[_oId].isPending && detailForEvent[_eId].isExecuted) {
+                uint withdrawAmount;
+                if (Orders[_oId].isWhite) {
+                    withdrawAmount = wmul(
+                        wdiv(
+                            Orders[_oId].amount,
+                            detailForEvent[_eId].whitePriceBefore
+                        ),
+                        detailForEvent[_eId].whitePriceAfter
+                    );
+                } else {
+                    withdrawAmount = wmul(
+                        wdiv(
+                            Orders[_oId].amount,
+                            detailForEvent[_eId].blackPriceBefore
+                        ),
+                        detailForEvent[_eId].blackPriceAfter
+                    );
+                }
+                totalWithdrawAmount = totalWithdrawAmount.add(withdrawAmount);
+            }
+        }
+        
+        uint feeAmount = wmul(totalWithdrawAmount, _FEE);
+        uint userWithdrawAmount = totalWithdrawAmount.sub(feeAmount);
+        
+        _collectedFee = _collectedFee.add(feeAmount);
+        _collateralToken.transfer(msg.sender, userWithdrawAmount);
+        emit collateralWithdrew(userWithdrawAmount);
+        
+        delete ordersOfUser[msg.sender];
+        
+        return totalWithdrawAmount;
+    }
 
-		// Calculate total W/B token amount ordered to this event.
-		for (uint i = 0; i < Orders.length; i++) {
-			Order storage _order = Orders[i];
-			if (_order.eventId == _eventId && _order.isPending) {
-				uint tokenAmount = wdiv(_order.amount, _order.price);
-				if (_order.isWhite) {
-					whiteTokenAmount = whiteTokenAmount.add(tokenAmount);
-				} else {
-					blackTokenAmount = blackTokenAmount.add(tokenAmount);
-				}
-			}
-		}
-
-		// Buy W/B tokens for this event.
-		_secondaryPool.buyWhite(_maxPrice, whiteTokenAmount);
-		_secondaryPool.buyBlack(_maxPrice, blackTokenAmount);
-	}
-
-	function eventEnd(uint _eventId) external onlyEventContract {
-
-		// Find orders for this event and change details
-		for (uint i = 0; i < Orders.length; i++) {
-			Order storage _order = Orders[i];
-			if (_order.eventId == _eventId && _order.isPending) {
-				uint newPrice = _order.isWhite
-					? _secondaryPool._whitePrice
-					: _secondaryPool._blackPrice;
-				_order.executingPrice = newPrice;
-				_order.isExecuted = true;
-				_order.isPending = false;
-			}
-		}
-
-		// Sell W/B tokens for this event.
-		_secondaryPool.sellWhite(_minPrice, whiteTokenAmount);
-		_secondaryPool.sellBlack(_minPrice, blackTokenAmount);
-		whiteTokenAmount = 0;
-		blackTokenAmount = 0;
-	}
-
-	function withdrawCollateral() external {
-		
-		// Find all executed orders of the user and sum up collaterals to return.
-		uint totalCollateral;		
-		for (uint i = 0; i < Orders.length; i++) {
-			Order storage _order = Orders[i];
-			if (_order.orderer == msg.sender && _order.isExecuted) {
-				totalCollateral = totalCollateral.add(
-					wmul(wdiv(_order.amount, _order.placingPrice), _order.executingPrice)
-				);
-			}
-		}
-
-		uint feeAmount = wmul(totalCollateral, _FEE);		
-		_collateralToken.transfer(msg.sender, totalCollateral.sub(feeAmount));
-
-		_collectedFee = _collectedFee.add(feeAmount);
-	}
-
-	function changeContractOwner(address _newOwnerAddress) external onlyOwner {
+    function changeContractOwner(address _newOwnerAddress) external onlyOwner {
 		require(
 			_newOwnerAddress != address(0),
-			"New owner adress should not be null"
+			"NEW OWNER ADDRESS SHOULD NOT BE NULL"
 		);
-		owner = _newOwnerAddress;
+		transferOwnership(_newOwnerAddress);
+		emit contractOwnerChanged(_newOwnerAddress);
+	}
+
+	function changeSecondaryPoolAddress(address _newPoolAddress) external onlyOwner {
+		require(
+			_newPoolAddress != address(0),
+			"NEW SECONDARYPOOL ADDRESS SHOULD NOT BE NULL"
+		);
+		_secondaryPoolAddress = _newPoolAddress;
+		emit secondaryPoolAddressChanged(_secondaryPoolAddress);
+	}
+
+	function changeEventContractAddress(address _newEventAddress) external onlyOwner {
+		require(
+			_newEventAddress != address(0),
+			"NEW EVENT ADDRESS SHOULD NOT BE NULL"
+		);
+		_eventContractAddress = _newEventAddress;
+		emit eventContractAddressChanged(_eventContractAddress);
 	}
 
 	function changeFeeWithdrawAddress(address _newFeeWithdrawAddress) external onlyOwner {
 		require(
 			_newFeeWithdrawAddress != address(0),
-			"New withdraw address should not be null"
+			"NEW WITHDRAW ADDRESS SHOULD NOT BE NULL"
 		);
 		_feeWithdrawAddress = _newFeeWithdrawAddress;
+		emit feeWithdrawAddressChanged(_feeWithdrawAddress);
 	}
 
 	function withdrawFee() external onlyOwner {
+	    require(
+	        _collateralToken.balanceOf(address(this)) >= _collectedFee,
+	        "INSUFFICIENT TOKEN(THAT IS LOWER THAN EXPECTED COLLECTEDFEE) IN PENDINGORDERS CONTRACT"
+	    );
 		_collateralToken.transfer(_feeWithdrawAddress, _collectedFee);
 		_collectedFee = 0;
+		emit feeWithdrew(_collectedFee);
 	}
 
 	function changeFee(uint _newFEE) external onlyOwner {
 		_FEE = _newFEE;
+		emit feeChanged(_FEE);
 	}
 
-	function getUserOrders() external {
-		Order[] storage userOrders;
-		for (uint i = 0; i < Orders.length; i++) {
-			if (Orders[i].orderer == msg.sender) {
-				userOrders.push(Order[i]);
-			}
-		}
-		// (isPending): Placed, not executed yet.
-		// (!isPending && executed): Placed, and executed.
-		// (!isPending && !executed): Placed, and canceled before execution
-		return userOrders;
-	}
 }
